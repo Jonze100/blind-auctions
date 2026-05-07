@@ -134,9 +134,38 @@ Tests submit bids of 100, 250, 180 and assert:
 | Vickrey | winner pays **180** (second-highest) |
 | Uniform (2 slots) | clearing price **180** |
 
-All 4 tests pass in ~53 seconds on a 2-node localnet.
+All 4 tests pass in ~53 seconds on a 2-node localnet. End-to-end devnet tests require circuit upload (~60 SOL, see Deployment below).
 
 ## Deployment
+
+### Devnet
+
+| Component | Status |
+|---|---|
+| **Program** | `GLB8HNet6sGBBDLs6QW3sFFNxdLfKMUHSFAxpe9JWs6u` (Solana devnet) |
+| **MXE** | Initialized on devnet cluster offset `456`, both arx nodes confirmed keygen |
+| **x25519 pubkey** | `19c670ae25cee18ddd80165701b03e90e1ff09295a5d978b13aa0f98c6665760` |
+| **Frontend** | `app/` — Next.js 14, connects to devnet, Phantom wallet |
+| **Circuits** | Not yet uploaded to devnet (see note below) |
+
+#### Circuit upload cost (devnet limitation)
+
+The four compiled circuits total **8.7 MB** of bytecode. Storing them on-chain requires rent-exempt deposits:
+
+```
+submit_bid.arcis        ~3.0 MB  →  ~20.9 SOL
+find_winner_sealed.arcis ~2.2 MB →  ~15.2 SOL
+find_winner_vickrey.arcis ~2.2 MB → ~15.2 SOL
+find_clearing_price.arcis ~1.3 MB → ~9.3 SOL
+──────────────────────────────────────────────
+Total                              ~60.6 SOL
+```
+
+Devnet airdrop is rate-limited to 2 SOL per request. Once the wallet is funded with ~60 SOL (via [faucet.solana.com](https://faucet.solana.com) with GitHub auth — up to 5 SOL per request), run `arcium test --cluster devnet` to upload all circuits. The test is idempotent and resumes from wherever it left off.
+
+Until circuits are uploaded, the on-chain program and bid encryption both work normally — MPC *computations* will queue on-chain but arx nodes cannot execute them without the bytecode.
+
+#### Deploy from scratch
 
 ```bash
 # Switch to devnet and fund wallet first
@@ -145,6 +174,12 @@ solana airdrop 2
 
 arcium build
 arcium deploy --cluster devnet
+
+# Initialize MXE (one-time, costs ~0.1 SOL)
+arcium init-mxe --recovery-set-size 4 --cluster-offset 456 --rpc-url devnet
+
+# Upload circuits and init computation definitions (~60 SOL required)
+arcium test --cluster devnet
 ```
 
 The devnet Arcium cluster offset is `456` (set in `Arcium.toml`).
