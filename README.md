@@ -1,120 +1,150 @@
-# Structure of this project
+# Blind Auctions on Solana × Arcium MPC
 
-This project is structured pretty similarly to how a regular Solana Anchor project is structured. The main difference lies in there being two places to write code here:
+A Solana program that runs sealed-bid, Vickrey, and uniform-price auctions with fully encrypted bids. No participant — including the auctioneer — can see any bid until the auction closes. Winner resolution happens inside an MPC cluster (Arcium's arx nodes) and only the result is revealed on-chain.
 
-- The `programs` dir like usual Anchor programs
-- The `encrypted-ixs` dir for confidential computing instructions
+---
 
-When working with plaintext data, we can edit it inside our program as normal. When working with confidential data though, state transitions take place off-chain using the Arcium network as a co-processor. For this, we then always need two instructions in our program: one that gets called to initialize a confidential computation, and one that gets called when the computation is done and supplies the resulting data. Additionally, since the types and operations in a Solana program and in a confidential computing environment are a bit different, we define the operations themselves in the `encrypted-ixs` dir using our Rust-based framework called Arcis. To link all of this together, we provide a few macros that take care of ensuring the correct accounts and data are passed for the specific initialization and callback functions:
+## How the MPC circuits work
+
+Arcium compiles the circuits in `encrypted-ixs/src/lib.rs` (written in the `arcis` DSL) into garbled-circuit bytecode executed across multiple arx nodes. Each node holds only a secret share of the data; no single node ever sees plaintext bids.
+
+### Encrypted data structures
 
 ```rust
-// encrypted-ixs/add_together.rs
-
-use arcis::*;
-
-#[encrypted]
-mod circuits {
-    use arcis::*;
-
-    pub struct InputValues {
-        v1: u8,
-        v2: u8,
-    }
-
-    #[instruction]
-    pub fn add_together(input_ctxt: Enc<Shared, InputValues>) -> Enc<Shared, u16> {
-        let input = input_ctxt.to_arcis();
-        let sum = input.v1 as u16 + input.v2 as u16;
-        input_ctxt.owner.from_arcis(sum)
-    }
-}
-
-// programs/my_program/src/lib.rs
-
-use anchor_lang::prelude::*;
-use arcium_anchor::prelude::*;
-
-declare_id!("<some ID>");
-
-#[arcium_program]
-pub mod my_program {
-    use super::*;
-
-    pub fn init_add_together_comp_def(ctx: Context<InitAddTogetherCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
-        Ok(())
-    }
-
-    pub fn add_together(
-        ctx: Context<AddTogether>,
-        computation_offset: u64,
-        ciphertext_0: [u8; 32],
-        ciphertext_1: [u8; 32],
-        pubkey: [u8; 32],
-        nonce: u128,
-    ) -> Result<()> {
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-        let args = ArgBuilder::new()
-            .x25519_pubkey(pubkey)
-            .plaintext_u128(nonce)
-            .encrypted_u8(ciphertext_0)
-            .encrypted_u8(ciphertext_1)
-            .build();
-
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            vec![AddTogetherCallback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &[]
-            )?],
-            1,
-            0,
-        )?;
-        Ok(())
-    }
-
-    #[arcium_callback(encrypted_ix = "add_together")]
-    pub fn add_together_callback(
-        ctx: Context<AddTogetherCallback>,
-        output: SignedComputationOutputs<AddTogetherOutput>,
-    ) -> Result<()> {
-        let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(AddTogetherOutput { field_0 }) => field_0,
-            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
-        };
-
-        emit!(SumEvent {
-            sum: o.ciphertexts[0],
-            nonce: o.nonce.to_le_bytes(),
-        });
-        Ok(())
-    }
-}
-
-#[queue_computation_accounts("add_together", payer)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct AddTogether<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
-
-#[callback_accounts("add_together")]
-#[derive(Accounts)]
-pub struct AddTogetherCallback<'info> {
-    // ... required accounts
-    pub some_extra_acc: AccountInfo<'info>,
-}
-
-#[init_computation_definition_accounts("add_together", payer)]
-#[derive(Accounts)]
-pub struct InitAddTogetherCompDef<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
+struct Bid     { amount: u64, bidder_lo: u128, bidder_hi: u128 }
+struct BidBook { bids: [Bid; 4], count: u64 }
 ```
+
+`BidBook` lives on-chain inside `AuctionState` as a `SharedEncryptedStruct`:
+
+```
+32 bytes  — x25519 public key (owner = MXE)
+16 bytes  — nonce
+13 × 32 bytes — Rescue ciphertexts  (4 bids × 3 fields + 1 count field)
+────────
+464 bytes total
+```
+
+Only the arx nodes can decrypt this blob. The Solana program never sees plaintext bid data.
+
+---
+
+### Circuit 1 — `submit_bid`
+
+**Inputs:** encrypted `Bid`, encrypted `BidBook`, plaintext `bid_count` (on-chain slot index)  
+**Output:** re-encrypted `BidBook`
+
+The circuit decrypts the current book, writes the new bid at index `bid_count` (passed as plaintext to avoid relying on the encrypted `count` field, which is garbage when the account is zero-initialised), increments `count`, and re-encrypts the whole book under the same shared key.
+
+```rust
+for i in 0..MAX_BIDS {
+    if i == bid_count { book.bids[i] = new_bid; }
+}
+book.count = bid_count + 1;
+```
+
+The Solana callback (`submit_bid_callback`) receives the new 464-byte encrypted blob and writes it back into `AuctionState.book_ciphertexts`.
+
+> **Why MAX_BIDS = 4?**  
+> Solana's max transaction size is 1232 bytes. At `MAX_BIDS = 32` the output is 3152 bytes — the arx node reports `OutputTooLarge` and the callback fails. With `MAX_BIDS = 4` the output is 464 bytes, which fits comfortably.
+
+---
+
+### Circuit 2 — `find_winner_sealed` (first-price sealed-bid)
+
+**Input:** encrypted `BidBook`  
+**Output:** `(clearing_price: u64, winner_lo: u128, winner_hi: u128)` — revealed in plaintext
+
+Iterates all active slots in constant time (no early exit — MPC cannot branch on secret data), tracking the highest bid. Ties are broken with `ArcisRNG::bool()` so the winner is unpredictable. Only the winner identity and the price they pay are revealed on-chain via a `AuctionWinnerEvent`.
+
+---
+
+### Circuit 3 — `find_winner_vickrey` (second-price sealed-bid)
+
+**Input:** encrypted `BidBook`  
+**Output:** `(clearing_price: u64, winner_lo: u128, winner_hi: u128)`
+
+Same oblivious scan, but tracks both the highest and second-highest amounts independently:
+
+```
+if bid > first:
+    second = first
+    first  = bid
+    winner = bidder
+elif bid > second and bid <= first:
+    second = bid
+```
+
+The winner is the highest bidder; `clearing_price` is the second-highest bid. This is the incentive-compatible Vickrey rule — truthful bidding is a dominant strategy.
+
+---
+
+### Circuit 4 — `find_clearing_price` (uniform-price / multi-unit)
+
+**Input:** encrypted `BidBook`, plaintext `slots` (number of units for sale)  
+**Output:** `clearing_price: u64`
+
+Copies all active bid amounts into a local array, runs a constant-time bubble sort (descending), and returns `top[slots - 1]` — the N-th highest bid. Every winning bidder pays this single clearing price.
+
+---
+
+## Auction flow
+
+```
+Client                      Solana program              Arcium arx nodes
+──────                      ──────────────              ────────────────
+encrypt bid with x25519
+  shared secret  ────────►  submit_bid ix
+                              queue_computation ──────►  decrypt BidBook
+                                                          insert new Bid
+                                                          re-encrypt BidBook
+                            submit_bid_callback ◄──────  return encrypted BidBook
+                              store ciphertexts
+
+                            find_winner_* ix  ─────────► decrypt BidBook
+                                                          compute winner
+                                                          reveal result
+                            callback ◄─────────────────  (price, winner_lo, winner_hi)
+                              emit AuctionWinnerEvent
+```
+
+---
+
+## Project layout
+
+```
+encrypted-ixs/src/lib.rs          ARCIS circuit definitions
+programs/blind_auctions/src/lib.rs Anchor/Solana program (instructions + callbacks)
+tests/blind_auctions.ts            End-to-end test suite
+build/*.arcis                      Compiled circuit bytecode (git-ignored)
+```
+
+## Running the test suite
+
+```bash
+# Requires: Docker, Anchor CLI, Arcium CLI, Solana CLI
+arcium test
+```
+
+Tests submit bids of 100, 250, 180 and assert:
+
+| Auction type | Expected result |
+|---|---|
+| Sealed-bid | winner pays **250** (bidder lo=2) |
+| Vickrey | winner pays **180** (second-highest) |
+| Uniform (2 slots) | clearing price **180** |
+
+All 4 tests pass in ~53 seconds on a 2-node localnet.
+
+## Deployment
+
+```bash
+# Switch to devnet and fund wallet first
+solana config set --url devnet
+solana airdrop 2
+
+arcium build
+arcium deploy --cluster devnet
+```
+
+The devnet Arcium cluster offset is `456` (set in `Arcium.toml`).
